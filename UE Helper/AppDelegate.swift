@@ -314,7 +314,7 @@ class LinkedBTDeviceMenu: NSObject, CBPeripheralDelegate {
 
 
 @NSApplicationMain
-class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSApplicationDelegate {
+class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSApplicationDelegate, NSMenuDelegate {
     @IBOutlet weak var statusMenu: NSMenu!
 
     var centralBLEManager: CBCentralManager!
@@ -323,6 +323,8 @@ class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSA
 
     var seenUEDevices: [UUID:LinkedBTDeviceMenu] = [:]
 
+    var beginScanning = false
+
     func centralManagerDidUpdateState(_ manager: CBCentralManager) {
         switch manager.state {
             case .poweredOff:
@@ -330,8 +332,12 @@ class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSA
                 self.centralBLEManager.stopScan()
             case .poweredOn:
                 print("BLE is now powered on")
-                self.centralBLEManager.scanForPeripherals(withServices: nil, options: [
-                    CBCentralManagerScanOptionAllowDuplicatesKey: true])
+
+                if self.beginScanning {
+                    print("Beginning scan")
+                    self.centralBLEManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+                    self.beginScanning = false
+                }
             case .resetting:  print("BLE is resetting")
             case .unauthorized:  print("Unauthorized BLE state")
             case .unknown:  print("Unknown BLE state")
@@ -339,6 +345,21 @@ class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSA
             @unknown default:
                 print("Unknown manager case!")
         }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        print("Opening the menu")
+
+        self.beginScanning = true
+
+        // Call this to trigger a scan
+        self.centralManagerDidUpdateState(self.centralBLEManager)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        print("Closing the menu")
+
+        self.centralBLEManager.stopScan()
     }
 
     func centralManager(_ manager: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData advertisement: [String : Any], rssi: NSNumber) {
@@ -375,9 +396,11 @@ class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSA
     }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
+        self.statusMenu.delegate = self
+
         // Setup the buttons
-        statusBarItem.button?.title = "UE"
-        statusBarItem.menu = self.statusMenu
+        self.statusBarItem.button?.title = "UE"
+        self.statusBarItem.menu = self.statusMenu
 
         let scanningMessage = NSMenuItem()
         scanningMessage.title = "Scanning..."
