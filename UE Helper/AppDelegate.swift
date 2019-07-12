@@ -2,6 +2,11 @@ import Cocoa
 import IOBluetooth
 import CoreBluetooth
 
+
+func hexEncode(_ data: Data) -> String {
+    return data.map { String(format: "%02hhX", $0) }.joined()
+}
+
 // CoreBluetooth doesn't seem to expose any way to do this
 func getBluetoothAdapterMAC() -> Data? {
     let addressString = IOBluetoothHostController.default()?.addressAsString()
@@ -42,6 +47,7 @@ enum UEBluetoothAnnounceCurrentState: UInt8, CustomStringConvertible {
 
 class UEBluetoothAnnounce {
     let batteryPercentage: UInt8
+    let batteryCharging: Bool
     let currentState: UEBluetoothAnnounceCurrentState
     let numShutdowns: UInt8
     let unknownRandom: Data
@@ -56,8 +62,19 @@ class UEBluetoothAnnounce {
             return nil
         }
 
-        self.batteryPercentage = data[4] as UInt8
+        let rawBatteryPercentage = data[4] as UInt8
+
+        // 0-99 is discharging, 100 is charged, 228 is fully charged
+        if rawBatteryPercentage < 127 {
+            self.batteryCharging = false
+            self.batteryPercentage = rawBatteryPercentage
+        } else {
+            self.batteryCharging = true
+            self.batteryPercentage = rawBatteryPercentage - 128
+        }
+
         assert(data[5] == 0x00)
+
         self.currentState = UEBluetoothAnnounceCurrentState(rawValue: data[6])!
         self.numShutdowns = data[7] as UInt8
         self.unknownRandom = data[8...13]
@@ -78,6 +95,7 @@ class LinkedBTDeviceMenu: NSObject, CBPeripheralDelegate {
     var manager: CBCentralManager
 
     var blePeripheralStateObserver: NSKeyValueObservation!
+    var ueAnnounceStateObserver: NSKeyValueObservation!
 
     var bluetoothConnectNotification: IOBluetoothUserNotification?
     var bluetoothDisconnectNotification: IOBluetoothUserNotification?
@@ -146,7 +164,8 @@ class LinkedBTDeviceMenu: NSObject, CBPeripheralDelegate {
         self.deviceSubmenu.addItem(self.currentStateItem)
         self.deviceSubmenu.addItem(self.rssiItem)
 
-        self.updateLabels()
+        self.updateLabels(old: nil, new: lastUEAnnounce)
+        self.notifyRSSI(rssi)
 
         self.blePeripheralStateObserver = self.blePeripheral.observe(\.state, options: [.old, .new], changeHandler: {(model, change) in
             switch self.blePeripheral.state {
@@ -173,43 +192,62 @@ class LinkedBTDeviceMenu: NSObject, CBPeripheralDelegate {
         })
     }
 
-    func updateLabels() {
-        // Submenu: "UE BOOM 2 ->"
-
-        // Clickable label
-        if [.CONNECTED_QUIET, .CONNECTED_PLAYING, .CONNECTED_HEADSET].contains(self.lastUEAnnounce.currentState) {
-            self.actionItem.title = "Turn off"
-        } else {
-            self.actionItem.title = "Turn on"
+    func updateLabels(old: UEBluetoothAnnounce?, new: UEBluetoothAnnounce) {
+        if old == nil || (self.getDisplayName(announce: old!) != self.getDisplayName(announce: new)) {
+            // Submenu: "UE BOOM 2 ->"
+            self.menuItem.title = self.getDisplayName(announce: new)
         }
 
-        self.batteryLevelItem.title = "Battery Level: \(self.lastUEAnnounce.batteryPercentage)%"
-        self.currentStateItem.title = "State: \(self.lastUEAnnounce.currentState)"
-        self.rssiItem.title = "RSSI: \(self.lastRSSI)"
+        if old == nil || (old!.currentState != new.currentState) {
+            // Clickable label
+            if [.CONNECTED_QUIET, .CONNECTED_PLAYING, .CONNECTED_HEADSET].contains(new.currentState) {
+                self.actionItem.title = "Turn off"
+            } else {
+                self.actionItem.title = "Turn on"
+            }
+        }
+
+        if old == nil || (old!.batteryCharging != new.batteryCharging) || (old!.batteryPercentage != new.batteryPercentage) {
+            if new.batteryCharging {
+                self.batteryLevelItem.title = "Battery Level: \(new.batteryPercentage)%, charging"
+            } else {
+                self.batteryLevelItem.title = "Battery Level: \(new.batteryPercentage)%"
+            }
+        }
+
+        if old == nil || (old!.currentState != new.currentState) {
+            self.currentStateItem.title = "State: \(self.lastUEAnnounce.currentState)"
+        }
     }
 
     func notifyAnnounce(_ announce: UEBluetoothAnnounce) {
+        let oldAnnounce = self.lastUEAnnounce
         self.lastUEAnnounce = announce
-        self.updateLabels()
+
+        self.updateLabels(old: oldAnnounce, new: announce)
     }
 
     func notifyRSSI(_ rssi: NSNumber) {
+        if self.lastRSSI == rssi {
+            return
+        }
+
         self.lastRSSI = rssi
-        self.updateLabels()
+        self.rssiItem.title = "RSSI: \(self.lastRSSI) dBm"
     }
 
-    func getDisplayName() -> String {
+    func getDisplayName(announce: UEBluetoothAnnounce) -> String {
         // My UE BOOM 2 doesn't advertise its name until you connect, which is pointless if you're just displaying it during a scan
         // Try the CBPeripheral name, then the IOBluetoothDevice name, and finally display its CBPeriperal UUID
-        if self.blePeripheral.name == nil || self.blePeripheral.name!.count == 0 {
-            if self.bluetoothDevice != nil {
-                return self.bluetoothDevice!.name
-            } else {
-                return "UE Speaker \(self.blePeripheral.identifier.uuidString)"
-            }
-        } else {
+        if self.blePeripheral.name != nil && self.blePeripheral.name!.count > 0 {
             return self.blePeripheral.name!
         }
+
+        if self.bluetoothDevice != nil && self.bluetoothDevice!.name != nil && self.bluetoothDevice!.name!.count > 0 {
+            return self.bluetoothDevice!.name
+        }
+
+        return "Unknown Speaker \(hexEncode(announce.unknownFixed))"
     }
 
     @objc func onBluetoothConnect() {
@@ -218,7 +256,7 @@ class LinkedBTDeviceMenu: NSObject, CBPeripheralDelegate {
         }
 
         print("Connected to device via Bluetooth classic!")
-        self.menuItem.attributedTitle = NSAttributedString(string: self.getDisplayName(), attributes: [
+        self.menuItem.attributedTitle = NSAttributedString(string: self.getDisplayName(announce: self.lastUEAnnounce), attributes: [
             NSAttributedString.Key.font: NSFontManager.shared.convert(NSFont.menuBarFont(ofSize: 0), toHaveTrait: .boldFontMask)
         ])
     }
@@ -229,7 +267,7 @@ class LinkedBTDeviceMenu: NSObject, CBPeripheralDelegate {
         }
 
         print("Disconnected from device via Bluetooth classic!")
-        self.menuItem.attributedTitle = NSAttributedString(string: self.getDisplayName(), attributes: [
+        self.menuItem.attributedTitle = NSAttributedString(string: self.getDisplayName(announce: self.lastUEAnnounce), attributes: [
             NSAttributedString.Key.font: NSFontManager.shared.convert(NSFont.menuBarFont(ofSize: 0), toHaveTrait: .unboldFontMask)
         ])
     }
@@ -372,6 +410,11 @@ class AppDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, NSA
         }
 
         guard let ueAnnounce = UEBluetoothAnnounce(fromData: data as! Data) else {
+            return
+        }
+
+        // Ignore the short announces
+        if ueAnnounce.unknownFixed.count == 0 {
             return
         }
 
